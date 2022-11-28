@@ -104,16 +104,17 @@ template <typename T> std::optional<T> bounded_spsc_queue<T>::pop() {
 }
 
 template <typename T> struct segment {
-  static std::atomic<int> id_;
-  int currentId_;
   std::atomic<index_t> writeIdx_{0};
-  index_t cachedReadIdx_ = 0;
+  index_t writerCachedReadIdx_ = 0;
+  index_t cachedWriteIdx_ = 0;
+
   std::byte cacheLineFiller1[CACHE_LINE_SIZE - 2 * sizeof(index_t) -
                              sizeof(std::atomic<index_t>)];
   std::atomic<index_t> readIdx_{0};
+  index_t readerCachedReadIdx_ = 0;
+  index_t readerCachedWriteIdx_ = 0;
   index_t readDeferCounter_ = 0;
-  index_t cachedWriteIdx_ = 0;
-  std::byte cacheLineFiller2[CACHE_LINE_SIZE - 2 * sizeof(index_t) -
+  std::byte cacheLineFiller2[CACHE_LINE_SIZE - 3 * sizeof(index_t) -
                              sizeof(std::atomic<index_t>)];
   size_t sizeMask_;
   std::atomic<segment *> nextSeg_ = nullptr;
@@ -144,93 +145,121 @@ template <typename T> struct segment {
     auto newSeg = new (ptrSegment) segment<T>(size);
     newSeg->data_ = reinterpret_cast<T *>(ptrData);
     newSeg->addr_ = reinterpret_cast<std::byte *>(ptrRawStorage);
-    auto prev = id_.fetch_add(1, std::memory_order_relaxed);
-    newSeg->currentId_ = prev;
     return reinterpret_cast<segment<T> *>(ptrSegment);
   }
 };
-template <typename T> std::atomic<int> segment<T>::id_{0};
 
 template <typename T> class spsc_queue {
   std::atomic<segment<T> *> writeSeg_;
+  segment<T> *cachedWriteSeg_ = nullptr;
+  std::byte cacheLineFiller1[CACHE_LINE_SIZE -
+                             sizeof(std::atomic<segment<T> *>) -
+                             sizeof(segment<T> *)];
+  segment<T> *cachedReadSeg_ = nullptr;
   std::atomic<segment<T> *> readSeg_;
-  size_t defaultSize_;
-  size_t sizeMask_;
+  size_t readDeferCounter_ = 0;
+  std::byte cachedLineFiller2[CACHE_LINE_SIZE -
+                              sizeof(std::atomic<segment<T> *>) -
+                              sizeof(segment<T> *) - sizeof(size_t)];
+  const size_t readBatchSize_;
+  const size_t defaultSize_;
+  const size_t sizeMask_;
   bool segment_has_free_slot(index_t writeIdx, index_t readIdx);
   bool segment_has_data(index_t writeIdx, index_t readIdx);
+  bool try_dequeue_with_cached_index(T &outVal, segment<T> *ptrSegment);
+  bool is_last_segment();
+  bool probe_next_segment(T &outResult);
+  bool dequeue_impl(T &outResult);
 
 public:
-  explicit spsc_queue(size_t defaultSize);
+  explicit spsc_queue(size_t defaultSize, size_t readBatchSize = 1);
   ~spsc_queue();
   bool enqueue(const T &val);
   bool enqueue(T &&val);
   bool dequeue(T &outVal);
   std::optional<T> dequeue();
+  void update_segment_cached_index(segment<T> *ptrSeg);
 };
 template <typename T>
-spsc_queue<T>::spsc_queue(size_t defaultSize)
-    : defaultSize_(defaultSize), sizeMask_(defaultSize - 1) {
+spsc_queue<T>::spsc_queue(size_t defaultSize, size_t readBatchSize)
+    : readBatchSize_(readBatchSize), defaultSize_(defaultSize),
+      sizeMask_(defaultSize - 1) {
   assert((defaultSize_ & sizeMask_) == 0);
   auto ptrSeg = segment<T>::make_segment(defaultSize);
   ptrSeg->nextSeg_ = ptrSeg;
+  cachedWriteSeg_ = ptrSeg;
+  cachedReadSeg_ = ptrSeg;
   writeSeg_.store(ptrSeg, std::memory_order_relaxed);
   readSeg_.store(ptrSeg, std::memory_order_seq_cst);
 }
 template <typename T> bool spsc_queue<T>::enqueue(const T &val) {
-  auto curSeg = writeSeg_.load(std::memory_order_relaxed);
-  auto writeIdx = curSeg->writeIdx_.load(std::memory_order_relaxed);
-  auto readIdx = curSeg->readIdx_.load(std::memory_order_relaxed);
-  if (segment_has_free_slot(writeIdx, readIdx)) {
-    new (curSeg->data_ + (writeIdx & sizeMask_)) T(val);
-    curSeg->writeIdx_.store(writeIdx + 1, std::memory_order_release);
+  auto curSeg = cachedWriteSeg_;
+  if (segment_has_free_slot(curSeg->cachedWriteIdx_,
+                            curSeg->writerCachedReadIdx_)) {
+    new (curSeg->data_ + (curSeg->cachedWriteIdx_ & sizeMask_)) T(val);
+    curSeg->cachedWriteIdx_++;
+    curSeg->writeIdx_.store(curSeg->cachedWriteIdx_, std::memory_order_release);
     return true;
+  } else {
+    curSeg->writerCachedReadIdx_ =
+        curSeg->readIdx_.load(std::memory_order_relaxed);
+    if (segment_has_free_slot(curSeg->cachedWriteIdx_,
+                              curSeg->writerCachedReadIdx_)) {
+      new (curSeg->data_ + (curSeg->cachedWriteIdx_ & sizeMask_)) T(val);
+      curSeg->cachedWriteIdx_++;
+      curSeg->writeIdx_.store(curSeg->cachedWriteIdx_,
+                              std::memory_order_release);
+      return true;
+    }
   }
 
   auto nextSeg = curSeg->nextSeg_.load(std::memory_order_relaxed);
-  auto nextSegWriteIdx = nextSeg->writeIdx_.load(std::memory_order_relaxed);
+  auto nextSegWriteIdx = nextSeg->cachedWriteIdx_;
   if (nextSeg != readSeg_.load(std::memory_order_relaxed)) {
     new (nextSeg->data_ + (nextSegWriteIdx & sizeMask_)) T(val);
-    nextSeg->writeIdx_.store(nextSegWriteIdx + 1, std::memory_order_relaxed);
+    nextSeg->cachedWriteIdx_++;
+    nextSeg->writeIdx_.store(nextSeg->cachedWriteIdx_,
+                             std::memory_order_relaxed);
+    cachedWriteSeg_ = nextSeg;
     writeSeg_.store(nextSeg, std::memory_order_release);
     return true;
   }
 
   auto newSeg = segment<T>::make_segment(defaultSize_);
   new (newSeg->data_) T(val);
-  newSeg->writeIdx_.store(1, std::memory_order_relaxed);
+  newSeg->cachedWriteIdx_ = 1;
+  newSeg->writeIdx_.store(newSeg->cachedWriteIdx_, std::memory_order_relaxed);
   newSeg->nextSeg_.store(nextSeg, std::memory_order_relaxed);
   curSeg->nextSeg_.store(newSeg, std::memory_order_relaxed);
+  cachedWriteSeg_ = newSeg;
   writeSeg_.store(newSeg, std::memory_order_release);
   return true;
 }
 
 template <typename T> std::optional<T> spsc_queue<T>::dequeue() {
-  auto curSeg = readSeg_.load(std::memory_order_relaxed);
-  auto curSegReadIdx = curSeg->readIdx_.load(std::memory_order_relaxed);
-  auto curSegWriteIdx = curSeg->writeIdx_.load(std::memory_order_acquire);
-  if (segment_has_data(curSegWriteIdx, curSegReadIdx)) {
-    auto retVal = curSeg->data_[curSegReadIdx & sizeMask_];
-    curSeg->readIdx_.store(curSegReadIdx + 1, std::memory_order_relaxed);
-    return {retVal};
-  }
-
-  if (curSeg == writeSeg_.load(std::memory_order_relaxed)) {
-    return std::nullopt;
-  }
-  auto nextSeg = curSeg->nextSeg_.load(std::memory_order_acquire);
-  auto nextSegReadIdx = nextSeg->readIdx_.load(std::memory_order_relaxed);
-  auto nextSegWriteIdx = nextSeg->writeIdx_.load(std::memory_order_relaxed);
-  if (segment_has_data(nextSegWriteIdx, nextSegReadIdx)) {
-    auto retVal = nextSeg->data_[nextSegReadIdx & sizeMask_];
-    nextSeg->readIdx_.store(nextSegReadIdx + 1, std::memory_order_relaxed);
-    readSeg_.store(nextSeg, std::memory_order_relaxed);
-    return {retVal};
+  T outVal;
+  if (dequeue_impl(outVal)) {
+    return {outVal};
   }
   return std::nullopt;
 }
+template <typename T> bool spsc_queue<T>::probe_next_segment(T &outResult) {
+  auto nextSeg = this->cachedReadSeg_->nextSeg_.load(std::memory_order_acquire);
+  update_segment_cached_index(nextSeg);
+  auto success = try_dequeue_with_cached_index(outResult, nextSeg);
+  if (success) {
+    this->cachedReadSeg_ = nextSeg;
+    this->readSeg_.store(this->cachedReadSeg_, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+template <typename T> bool spsc_queue<T>::is_last_segment() {
+  return cachedReadSeg_ == writeSeg_.load(std::memory_order_relaxed);
+}
 template <typename T>
 bool spsc_queue<T>::segment_has_free_slot(index_t writeIdx, index_t readIdx) {
-  return (writeIdx - readIdx) < defaultSize_;
+  return ((writeIdx - readIdx) & defaultSize_) == 0;
 }
 template <typename T>
 bool spsc_queue<T>::segment_has_data(index_t writeIdx, index_t readIdx) {
@@ -244,6 +273,46 @@ template <typename T> spsc_queue<T>::~spsc_queue() {
     writeSeg = writeSeg->nextSeg_;
   }
   readSeg->~segment<T>();
+}
+template <typename T>
+bool spsc_queue<T>::try_dequeue_with_cached_index(T &outVal,
+                                                  segment<T> *ptrSegment) {
+  auto curSegReadIdx =
+      ptrSegment->readerCachedReadIdx_ + ptrSegment->readDeferCounter_;
+  auto curSegWriteIdx = ptrSegment->readerCachedWriteIdx_;
+  if (segment_has_data(curSegWriteIdx, curSegReadIdx)) {
+    outVal = ptrSegment->data_[curSegReadIdx & sizeMask_];
+    ptrSegment->readDeferCounter_++;
+    if (ptrSegment->readDeferCounter_ == readBatchSize_) {
+      ptrSegment->readerCachedReadIdx_ += ptrSegment->readDeferCounter_;
+      ptrSegment->readDeferCounter_ = 0;
+      ptrSegment->readIdx_.store(ptrSegment->readerCachedReadIdx_,
+                                 std::memory_order_relaxed);
+    }
+    return true;
+  }
+  return false;
+}
+template <typename T>
+void spsc_queue<T>::update_segment_cached_index(segment<T> *ptrSeg) {
+  ptrSeg->readerCachedWriteIdx_ =
+      ptrSeg->writeIdx_.load(std::memory_order_relaxed);
+}
+template <typename T> bool spsc_queue<T>::dequeue_impl(T &outResult) {
+  if (try_dequeue_with_cached_index(outResult, cachedReadSeg_)) {
+    return true;
+  }
+  update_segment_cached_index(cachedReadSeg_);
+  if (try_dequeue_with_cached_index(outResult, cachedReadSeg_)) {
+    return true;
+  }
+  if (is_last_segment()) {
+    return false;
+  }
+  return probe_next_segment(outResult);
+}
+template <typename T> bool spsc_queue<T>::dequeue(T &outVal) {
+  return dequeue_impl(outVal);
 }
 
 } // namespace kv_lockfree
