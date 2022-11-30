@@ -1,3 +1,7 @@
+#ifndef KV_LOCKFREE_SPSC_HPP
+#define KV_LOCKFREE_SPSC_HPP
+
+#include "segment.hpp"
 #include "utils.hpp"
 #include <algorithm>
 #include <atomic>
@@ -102,53 +106,6 @@ template <typename T> std::optional<T> bounded_spsc_queue<T>::pop() {
   }
   return {retVal};
 }
-
-template <typename T> struct segment {
-  std::atomic<index_t> writeIdx_{0};
-  index_t writerCachedReadIdx_ = 0;
-  index_t cachedWriteIdx_ = 0;
-
-  std::byte cacheLineFiller1[CACHE_LINE_SIZE - 2 * sizeof(index_t) -
-                             sizeof(std::atomic<index_t>)];
-  std::atomic<index_t> readIdx_{0};
-  index_t readerCachedReadIdx_ = 0;
-  index_t readerCachedWriteIdx_ = 0;
-  index_t readDeferCounter_ = 0;
-  std::byte cacheLineFiller2[CACHE_LINE_SIZE - 3 * sizeof(index_t) -
-                             sizeof(std::atomic<index_t>)];
-  size_t sizeMask_;
-  std::atomic<segment *> nextSeg_ = nullptr;
-  size_t size_;
-  T *data_ = nullptr;
-  std::byte *addr_ = nullptr;
-  segment(size_t size) : size_(size) {}
-  ~segment() {
-    if (addr_) {
-      delete[] addr_;
-    }
-  }
-  static segment *make_segment(size_t size) {
-    auto requestSize = sizeof(segment<T>) + std::alignment_of_v<segment<T>> - 1;
-    requestSize += sizeof(T) * size + std::alignment_of_v<T> - 1;
-    void *ptrRawStorage = new std::byte[requestSize];
-    assert(ptrRawStorage);
-    auto ptrSegment =
-        std::align(std::alignment_of_v<segment<T>>, sizeof(segment<T>),
-                   ptrRawStorage, requestSize);
-    assert(ptrSegment);
-    void *tmpPtrData =
-        reinterpret_cast<std::byte *>(ptrSegment) + sizeof(segment<T>);
-    requestSize -= sizeof(segment<T>);
-    auto ptrData = std::align(std::alignment_of_v<T>, sizeof(T) * size,
-                              tmpPtrData, requestSize);
-    assert(ptrData);
-    auto newSeg = new (ptrSegment) segment<T>(size);
-    newSeg->data_ = reinterpret_cast<T *>(ptrData);
-    newSeg->addr_ = reinterpret_cast<std::byte *>(ptrRawStorage);
-    return reinterpret_cast<segment<T> *>(ptrSegment);
-  }
-};
-
 template <typename T> class spsc_queue {
   std::atomic<segment<T> *> writeSeg_;
   segment<T> *cachedWriteSeg_ = nullptr;
@@ -166,9 +123,11 @@ template <typename T> class spsc_queue {
   const size_t sizeMask_;
   bool segment_has_free_slot(index_t writeIdx, index_t readIdx);
   bool segment_has_data(index_t writeIdx, index_t readIdx);
-  bool try_dequeue_with_cached_index(T &outVal, segment<T> *ptrSegment);
-  bool is_last_segment();
-  bool probe_next_segment(T &outResult);
+  KV_FORCE_INLINE bool try_dequeue_with_cached_index(T &outVal,
+                                                     segment<T> *ptrSegment);
+  KV_FORCE_INLINE void update_segment_cached_index(segment<T> *ptrSeg);
+  KV_FORCE_INLINE bool is_last_segment();
+  KV_FORCE_INLINE bool probe_next_segment(T &outResult);
   bool dequeue_impl(T &outResult);
 
 public:
@@ -178,7 +137,6 @@ public:
   bool enqueue(T &&val);
   bool dequeue(T &outVal);
   std::optional<T> dequeue();
-  void update_segment_cached_index(segment<T> *ptrSeg);
 };
 template <typename T>
 spsc_queue<T>::spsc_queue(size_t defaultSize, size_t readBatchSize)
@@ -194,31 +152,31 @@ spsc_queue<T>::spsc_queue(size_t defaultSize, size_t readBatchSize)
 }
 template <typename T> bool spsc_queue<T>::enqueue(const T &val) {
   auto curSeg = cachedWriteSeg_;
-  if (segment_has_free_slot(curSeg->cachedWriteIdx_,
+  if (segment_has_free_slot(curSeg->writerCachedWriteIdx_,
                             curSeg->writerCachedReadIdx_)) {
-    new (curSeg->data_ + (curSeg->cachedWriteIdx_ & sizeMask_)) T(val);
-    curSeg->cachedWriteIdx_++;
-    curSeg->writeIdx_.store(curSeg->cachedWriteIdx_, std::memory_order_release);
+    new (curSeg->data_ + (curSeg->writerCachedWriteIdx_ & sizeMask_)) T(val);
+    curSeg->writerCachedWriteIdx_++;
+    curSeg->writeIdx_.store(curSeg->writerCachedWriteIdx_, std::memory_order_release);
     return true;
   } else {
     curSeg->writerCachedReadIdx_ =
         curSeg->readIdx_.load(std::memory_order_relaxed);
-    if (segment_has_free_slot(curSeg->cachedWriteIdx_,
+    if (segment_has_free_slot(curSeg->writerCachedWriteIdx_,
                               curSeg->writerCachedReadIdx_)) {
-      new (curSeg->data_ + (curSeg->cachedWriteIdx_ & sizeMask_)) T(val);
-      curSeg->cachedWriteIdx_++;
-      curSeg->writeIdx_.store(curSeg->cachedWriteIdx_,
+      new (curSeg->data_ + (curSeg->writerCachedWriteIdx_ & sizeMask_)) T(val);
+      curSeg->writerCachedWriteIdx_++;
+      curSeg->writeIdx_.store(curSeg->writerCachedWriteIdx_,
                               std::memory_order_release);
       return true;
     }
   }
 
   auto nextSeg = curSeg->nextSeg_.load(std::memory_order_relaxed);
-  auto nextSegWriteIdx = nextSeg->cachedWriteIdx_;
+  auto nextSegWriteIdx = nextSeg->writerCachedWriteIdx_;
   if (nextSeg != readSeg_.load(std::memory_order_relaxed)) {
     new (nextSeg->data_ + (nextSegWriteIdx & sizeMask_)) T(val);
-    nextSeg->cachedWriteIdx_++;
-    nextSeg->writeIdx_.store(nextSeg->cachedWriteIdx_,
+    nextSeg->writerCachedWriteIdx_++;
+    nextSeg->writeIdx_.store(nextSeg->writerCachedWriteIdx_,
                              std::memory_order_relaxed);
     cachedWriteSeg_ = nextSeg;
     writeSeg_.store(nextSeg, std::memory_order_release);
@@ -227,8 +185,8 @@ template <typename T> bool spsc_queue<T>::enqueue(const T &val) {
 
   auto newSeg = segment<T>::make_segment(defaultSize_);
   new (newSeg->data_) T(val);
-  newSeg->cachedWriteIdx_ = 1;
-  newSeg->writeIdx_.store(newSeg->cachedWriteIdx_, std::memory_order_relaxed);
+  newSeg->writerCachedWriteIdx_ = 1;
+  newSeg->writeIdx_.store(newSeg->writerCachedWriteIdx_, std::memory_order_relaxed);
   newSeg->nextSeg_.store(nextSeg, std::memory_order_relaxed);
   curSeg->nextSeg_.store(newSeg, std::memory_order_relaxed);
   cachedWriteSeg_ = newSeg;
@@ -316,3 +274,4 @@ template <typename T> bool spsc_queue<T>::dequeue(T &outVal) {
 }
 
 } // namespace kv_lockfree
+#endif // KV_LOCKFREE_SPMC_HPP
