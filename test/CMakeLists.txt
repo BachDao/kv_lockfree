@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.10.0)
-project(kv-lockfree VERSION 0.1.0)
 
 file(GLOB SRC_TEST ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 
@@ -16,3 +14,6 @@ if(LINUX)
     target_link_libraries(${PROJECT_NAME}-test "${CMAKE_THREAD_LIBS_INIT}")
   endif()
 endif()
+
+add_subdirectory(libs/gtest)
+target_link_libraries(${PROJECT_NAME}-test "GTest::gtest_main" "GTest::gtest")

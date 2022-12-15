@@ -11,3 +11,4 @@ target_include_directories(kv-lockfree INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/inc
 
 #test
 add_subdirectory(test)
+add_subdirectory(sample)
