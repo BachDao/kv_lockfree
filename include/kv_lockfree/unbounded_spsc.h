@@ -4,6 +4,9 @@
 #include "utils.hpp"
 #include <optional>
 #include <type_traits>
+#include <memory>
+#include <atomic>
+#include <cassert>
 #ifndef KV_LOCKFREE_UNBOUNDED_SPSC_H
 namespace kv_lockfree {
 namespace detail {

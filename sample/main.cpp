@@ -1,28 +1,37 @@
 #include "kv_lockfree/unbounded_spsc.h"
+#include <cassert>
+#include <iostream>
 #include <thread>
-int main() {
-  kv_lockfree::unbounded_spsc<int> q{4};
-  size_t testRound = 1024 * 1024 * 128;
+
+void unbounded_test() {
+  kv_lockfree::unbounded_spsc<uint64_t> q{4};
 
   std::thread reader{[&] {
-    int outVal = -1;
-    for (int i = 0; i < testRound;) {
+    uint64_t outVal = -1;
+    uint64_t index = 0;
+    while (true) {
       if (q.dequeue(outVal)) {
-        assert(outVal == i);
-        i++;
+        assert(outVal == index);
+        index++;
       }
     }
   }};
 
   std::thread writer{[&] {
-    for (int i = 0; i < testRound;) {
-      if (q.enqueue(i)) {
-        i++;
+    uint64_t index = 0;
+    while (true) {
+      if (q.enqueue(index)) {
+        index++;
       }
     }
   }};
 
   writer.join();
   reader.join();
+  std::cout << "done" << std::endl;
+}
+
+int main() {
+  unbounded_test();
   return 0;
 }
