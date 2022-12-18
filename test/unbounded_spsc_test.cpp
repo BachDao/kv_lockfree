@@ -9,7 +9,7 @@ template <typename T> void print(const T &msg) { std::cout << msg << "\n"; }
 using namespace kv_lockfree;
 TEST(ubounded_spsc, single_thread_put_then_get) {
   unbounded_spsc<int> q{4};
-  size_t testRound = 128;
+  size_t testRound = 1024;
   for (int i = 0; i < testRound;) {
     if (q.enqueue(i)) {
       i++;
